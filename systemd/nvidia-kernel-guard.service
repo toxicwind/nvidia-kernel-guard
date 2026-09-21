@@ -1,0 +1,13 @@
+[Unit]
+Description=nvidia-kernel-guard: verify the running kernel has NVIDIA modules
+After=multi-user.target
+ConditionPathExists=/usr/bin/nkg
+
+[Service]
+Type=oneshot
+# Loud on purpose: a missing driver here is a black screen next boot.
+ExecStart=/bin/sh -c '/usr/bin/nkg audit --boot || /usr/bin/wall "nvidia-kernel-guard: RUNNING KERNEL HAS NO NVIDIA DRIVER - run: sudo nkg fix"'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

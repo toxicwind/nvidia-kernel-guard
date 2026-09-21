@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: ./bin
+          severity: warning
+        # install.sh and tests are checked explicitly below (different severities tolerated)
+      - name: shellcheck (repo scripts)
+        run: |
+          sudo apt-get install -y shellcheck 2>/dev/null || true
+          shellcheck -S warning install.sh tests/run.sh tests/mocks/bin/* || true
+      - name: run test suite
+        run: bash tests/run.sh

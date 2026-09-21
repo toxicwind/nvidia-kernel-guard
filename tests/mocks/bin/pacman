@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Mock pacman for nkg tests. Fixture-driven via $NKG_TEST_FIXTURE.
+# Fixture files: installed.db (name|version), repo.db (name per line),
+#                files.db (pkg|path), owners.db (path|owner|version)
+set -uo pipefail
+F="${NKG_TEST_FIXTURE:?}"
+LOG="${MOCK_LOG:-/dev/null}"
+
+case "${1:-}" in
+  -Qq)
+    if [[ $# -eq 1 ]]; then
+      cut -d'|' -f1 "$F/installed.db" 2>/dev/null || true
+    else
+      awk -F'|' -v p="$2" '$1==p{found=1; exit} END{exit !found}' "$F/installed.db" 2>/dev/null
+    fi
+    ;;
+  -Q)
+    line="$(awk -F'|' -v p="$2" '$1==p{print; exit}' "$F/installed.db" 2>/dev/null || true)"
+    [[ -n "$line" ]] || exit 1
+    echo "${line%%|*} ${line#*|}"
+    ;;
+  -Ql)
+    awk -F'|' -v p="$2" '$1==p{print substr($0, index($0, "|")+1)}' "$F/files.db" 2>/dev/null || true
+    ;;
+  -Si)
+    grep -qx "$2" "$F/repo.db" 2>/dev/null
+    ;;
+  -Qo)
+    line="$(grep "^${2}|" "$F/owners.db" 2>/dev/null | head -1 || true)"
+    [[ -n "$line" ]] || exit 1
+    owner="$(cut -d'|' -f2 <<<"$line")"; ver="$(cut -d'|' -f3 <<<"$line")"
+    echo "$2 is owned by $owner $ver"
+    ;;
+  -S)
+    shift
+    for a in "$@"; do [[ "$a" == -* ]] && continue
+      echo "INSTALL $a" >> "$LOG"
+      awk -F'|' -v p="$a" '$1==p{found=1; exit} END{exit !found}' "$F/installed.db" 2>/dev/null \
+        || echo "${a}|9.9.9-test" >> "$F/installed.db"
+    done
+    ;;
+  *)
+    echo "mock pacman: unsupported args: $*" >&2; exit 99 ;;
+esac

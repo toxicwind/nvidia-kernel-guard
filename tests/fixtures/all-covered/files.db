@@ -1,0 +1,3 @@
+linux-cachyos|/boot/vmlinuz-linux-cachyos
+linux-cachyos-bore|/boot/vmlinuz-linux-cachyos-bore
+linux-cachyos-server|/boot/vmlinuz-linux-cachyos-server

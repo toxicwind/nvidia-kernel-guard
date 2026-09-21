@@ -1,0 +1,13 @@
+[Unit]
+Description=nvidia-kernel-guard: install missing NVIDIA drivers post-transaction
+After=network-online.target
+ConditionPathExists=/usr/bin/nkg
+
+[Service]
+Type=oneshot
+# Runs nkg autofix, which installs missing/skewed drivers only when
+# HOOK_AUTOFIX=yes in /etc/nvidia-kernel-guard.conf. Post-transaction only:
+# never runs inside the pacman db lock.
+ExecStart=/usr/bin/nkg autofix
+Nice=10
+IOSchedulingClass=idle

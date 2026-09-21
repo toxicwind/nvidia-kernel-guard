@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# nvidia-kernel-guard (nkg) — every installed kernel gets its NVIDIA driver.
+#
+# The failure mode this kills: you install/boot a new kernel flavor
+# (linux-cachyos-bore, linux-zen, ...) and the matching prebuilt NVIDIA
+# package was never installed -> display manager can't light the GPU ->
+# black screen, no console fallback.
+#
+# Subcommands:
+#   audit [--json] [--boot]   report kernel -> driver coverage
+#   fix [--yes]               install missing/skewed driver packages + rebuild initramfs
+#   autofix                   fix --yes, but only when HOOK_AUTOFIX=yes (path-unit entrypoint)
+#   hook                      called by the pacman hook (warns, never installs)
+#
+# Driver states: covered | covered-dkms | skewed | missing-repo | missing-unknown
+#
+# Config: /etc/nvidia-kernel-guard.conf
+#   DRIVER_FLAVOR=open|proprietary   (default: open)
+#   AUTO_FIX=no|yes                  (default: no; `fix` prompts)
+#   HOOK_AUTOFIX=no|yes              (default: yes; pacman hook auto-installs
+#                                     missing drivers post-transaction via the
+#                                     path unit + oneshot service)
+
+set -euo pipefail
+
+CONFIG="${NKG_CONFIG:-/etc/nvidia-kernel-guard.conf}"
+DRIVER_FLAVOR="${NKG_DRIVER_FLAVOR:-open}"
+AUTO_FIX="${NKG_AUTO_FIX:-no}"
+HOOK_AUTOFIX="${NKG_HOOK_AUTOFIX:-yes}"
+MODULES_DIR="${NKG_MODULES_DIR:-/usr/lib/modules}"
+STATE_DIR="${NKG_STATE_DIR:-/var/lib/nvidia-kernel-guard}"
+
+if [[ -f "$CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG"
+fi
+
+need_root() {
+    [[ -n "${NKG_ALLOW_NONROOT:-}" ]] && return 0
+    if [[ $EUID -ne 0 ]]; then
+        echo "nkg: this needs root (try sudo)" >&2
+        exit 1
+    fi
+}
+
+pkg_ver() { # installed version of $1, or empty
+    pacman -Q "$1" 2>/dev/null | awk '{print $2}'
+}
+
+# All installed kernel packages, from two independent sources merged:
+#   1. pacman: packages named linux* that ship /boot/vmlinuz-*
+#   2. /usr/lib/modules/<release>/vmlinuz (+ pkgbase file): catches kernels
+#      whose image lives in the modules dir (UKI / systemd-boot layouts).
+# Orphaned module dirs (no pkgbase, no owning package) are skipped.
+installed_kernels() {
+    local pkg k seen=""
+    # source 1: pacman
+    while read -r pkg; do
+        [[ -z "$pkg" ]] && continue
+        case "$pkg" in
+            *-headers|linux-firmware*) continue ;;
+        esac
+        if pacman -Ql "$pkg" 2>/dev/null | grep -qE '/boot/vmlinuz-'; then
+            echo "$pkg"; seen+=" $pkg"
+        fi
+    done < <(pacman -Qq 2>/dev/null | grep -E '^linux(-[a-z0-9]+)*$' || true)
+    # source 2: /usr/lib/modules/*/vmlinuz
+    local d rel pb owner
+    for d in "$MODULES_DIR"/*/; do
+        [[ -d "$d" ]] || continue
+        [[ -f "${d}vmlinuz" ]] || continue
+        rel="${d%/}"; rel="${rel##*/}"
+        pb=""
+        [[ -f "${d}pkgbase" ]] && pb="$(<"${d}pkgbase")"
+        if [[ -z "$pb" ]]; then
+            owner="$(pacman -Qo "$d" 2>/dev/null | awk '{print $5}')" || true
+            [[ "$owner" =~ ^linux(-[a-z0-9]+)*$ ]] && pb="$owner"
+        fi
+        [[ -z "$pb" ]] && continue                      # orphaned dir: skip
+        pacman -Qq "$pb" >/dev/null 2>&1 || continue     # not installed: skip
+        case " $seen " in
+            *" $pb "*) continue ;;
+        esac
+        echo "$pb"; seen+=" $pb"
+    done
+}
+
+# Is nvidia-open-dkms (the universal fallback) installed?
+has_dkms() { pacman -Qq nvidia-open-dkms >/dev/null 2>&1; }
+
+# Print the driver package name that covers kernel $1, or empty if none known.
+# Sets globals: DRIVER_PKG, DRIVER_STATE, DRIVER_DETAIL
+#   covered | covered-dkms | skewed | missing-repo | missing-unknown
+driver_for_kernel() {
+    local k="$1" cand
+    DRIVER_PKG=""; DRIVER_STATE="missing-unknown"; DRIVER_DETAIL=""
+    local -a candidates=()
+    if [[ "$DRIVER_FLAVOR" == "open" ]]; then
+        candidates+=("${k}-nvidia-open")
+    else
+        candidates+=("${k}-nvidia")
+    fi
+    case "$k" in
+        linux)     candidates+=("nvidia-open" "nvidia") ;;
+        linux-lts) candidates+=("nvidia-lts" "nvidia-open-lts") ;;
+    esac
+    for cand in "${candidates[@]}"; do
+        if pacman -Qq "$cand" >/dev/null 2>&1; then
+            DRIVER_PKG="$cand"; DRIVER_STATE="covered"
+            # version skew: per-kernel prebuilt drivers must track the kernel
+            if [[ "$cand" == "${k}-nvidia"* ]]; then
+                local kv dv
+                kv="$(pkg_ver "$k")"; dv="$(pkg_ver "$cand")"
+                if [[ -n "$kv" && -n "$dv" && "$kv" != "$dv" ]]; then
+                    DRIVER_STATE="skewed"
+                    DRIVER_DETAIL="kernel $kv vs driver $dv"
+                fi
+            fi
+            return 0
+        fi
+    done
+    # universal fallback covers everything if installed
+    if has_dkms; then
+        DRIVER_PKG="nvidia-open-dkms"; DRIVER_STATE="covered-dkms"
+        return 0
+    fi
+    for cand in "${candidates[@]}"; do
+        if pacman -Si "$cand" >/dev/null 2>&1; then
+            DRIVER_PKG="$cand"; DRIVER_STATE="missing-repo"; return 0
+        fi
+    done
+    return 0
+}
+
+# Does the RUNNING kernel actually have nvidia modules on disk?
+running_kernel_has_modules() {
+    local krel
+    krel="$(uname -r)"
+    find "${MODULES_DIR}/${krel}" -name 'nvidia.ko*' 2>/dev/null | grep -q .
+}
+
+audit() {
+    local json=0 k
+    local boot=0
+    for a in "$@"; do
+        [[ "$a" == "--json" ]] && json=1
+        [[ "$a" == "--boot" ]] && boot=1
+    done
+    local kernels
+    kernels="$(installed_kernels)"
+    if [[ -z "$kernels" ]]; then
+        echo "nkg: no kernel packages found" >&2
+        return 2
+    fi
+    local gaps=0 out=""
+    while read -r k; do
+        [[ -z "$k" ]] && continue
+        driver_for_kernel "$k"
+        case "$DRIVER_STATE" in
+            covered|covered-dkms) ;;
+            *) gaps=$((gaps+1)) ;;
+        esac
+        if [[ $json -eq 1 ]]; then
+            out+="{\"kernel\":\"$k\",\"driver\":\"$DRIVER_PKG\",\"state\":\"$DRIVER_STATE\",\"detail\":\"$DRIVER_DETAIL\"},"
+        else
+            local mark="OK  "
+            [[ "$DRIVER_STATE" == "covered-dkms" ]] && mark="OK* "
+            case "$DRIVER_STATE" in
+                covered|covered-dkms) ;;
+                *) mark="GAP " ;;
+            esac
+            printf '%s %-28s -> %-36s (%s%s)\n' "$mark" "$k" "${DRIVER_PKG:-?}" \
+                "$DRIVER_STATE" "${DRIVER_DETAIL:+: $DRIVER_DETAIL}"
+        fi
+    done <<< "$kernels"
+    if [[ $json -eq 1 ]]; then
+        echo "{\"kernels\":[${out%,}],\"gaps\":$gaps}"
+    fi
+    if [[ $boot -eq 1 ]]; then
+        if ! running_kernel_has_modules; then
+            echo "nkg BOOT ALERT: running kernel $(uname -r) has NO nvidia modules installed." >&2
+            echo "nkg BOOT ALERT: graphical session will fail. Run: sudo nkg fix" >&2
+            return 3
+        fi
+    fi
+    return $gaps
+}
+
+fix() {
+    need_root
+    local yes=0 k fixed=0
+    [[ "${1:-}" == "--yes" ]] && yes=1
+    while read -r k; do
+        [[ -z "$k" ]] && continue
+        driver_for_kernel "$k"
+        case "$DRIVER_STATE" in
+            covered|covered-dkms)
+                echo "nkg: $k already covered by $DRIVER_PKG" ;;
+            skewed)
+                echo "nkg: $k driver skewed ($DRIVER_DETAIL) — reinstalling $DRIVER_PKG ..."
+                pacman -S --noconfirm "$DRIVER_PKG"
+                fixed=$((fixed+1))
+                ;;
+            missing-repo)
+                if [[ $yes -eq 0 && "$AUTO_FIX" != "yes" ]]; then
+                    read -r -p "nkg: install $DRIVER_PKG for $k? [y/N] " ans
+                    [[ "$ans" =~ ^[Yy]$ ]] || continue
+                fi
+                echo "nkg: installing $DRIVER_PKG ..."
+                pacman -S --noconfirm "$DRIVER_PKG"
+                fixed=$((fixed+1))
+                ;;
+            missing-unknown)
+                echo "nkg: no prebuilt driver package known for $k."
+                echo "nkg: consider nvidia-open-dkms (covers every kernel): sudo pacman -S nvidia-open-dkms ${k}-headers"
+                ;;
+        esac
+    done < <(installed_kernels)
+    if [[ $fixed -gt 0 ]]; then
+        echo "nkg: rebuilding initramfs for all kernels ..."
+        mkinitcpio -P
+        echo "nkg: verifying modules for running kernel ..."
+        if running_kernel_has_modules; then
+            echo "nkg: nvidia modules present for $(uname -r)"
+        else
+            echo "nkg: WARNING: still no nvidia modules for $(uname -r) — check dkms/kernel mismatch" >&2
+        fi
+    fi
+    echo "nkg: done."
+}
+
+autofix() {
+    # Path-unit entrypoint. Runs fix --yes only when HOOK_AUTOFIX=yes;
+    # otherwise just reports (the hook already warned).
+    if [[ "$HOOK_AUTOFIX" != "yes" ]]; then
+        echo "nkg: autofix disabled (HOOK_AUTOFIX=$HOOK_AUTOFIX) — run: sudo nkg fix" >&2
+        return 0
+    fi
+    fix --yes
+    # clear the pending flag only if the gaps are actually gone
+    if audit >/dev/null 2>&1; then
+        rm -f "$STATE_DIR/pending"
+    fi
+}
+
+hook() {
+    # Called by the pacman hook in PostTransaction. Never installs (db lock).
+    # Warns loudly and records pending gaps; the path unit picks them up.
+    local gaps
+    gaps="$(audit 2>/dev/null | grep -c '^GAP ' || true)"
+    if [[ "$gaps" -gt 0 ]]; then
+        cat >&2 <<EOF
+nvidia-kernel-guard: WARNING: $gaps installed kernel(s) have no NVIDIA driver package.
+nvidia-kernel-guard: WARNING: booting one of them = black screen. Run: sudo nkg fix
+EOF
+        mkdir -p "$STATE_DIR"
+        date -u +%FT%TZ > "$STATE_DIR/pending"
+        # nudge the path unit in case inotify coalesced the write
+        systemctl start nvidia-kernel-guard-autofix.service >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -f "$STATE_DIR/pending"
+    return 0
+}
+
+usage() {
+    cat <<EOF
+nkg - nvidia-kernel-guard: every installed kernel gets its NVIDIA driver.
+
+Usage:
+  nkg audit [--json] [--boot]   show kernel -> driver coverage (exit = gap count)
+  nkg fix [--yes]               install missing/skewed drivers, rebuild initramfs
+  nkg autofix                   fix --yes iff HOOK_AUTOFIX=yes (path-unit entrypoint)
+  nkg hook                      pacman-hook entrypoint (warn only, never installs)
+
+Config: $CONFIG  (DRIVER_FLAVOR=open|proprietary, AUTO_FIX=no|yes, HOOK_AUTOFIX=no|yes)
+States: covered | covered-dkms | skewed | missing-repo | missing-unknown
+EOF
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    audit) shift; audit "$@" ;;
+    fix)   shift; fix "$@" ;;
+    autofix) autofix ;;
+    hook)  hook ;;
+    *)     usage; exit 2 ;;
+esac

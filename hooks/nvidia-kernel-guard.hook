@@ -1,0 +1,14 @@
+[Trigger]
+Operation=Install
+Operation=Upgrade
+Operation=Remove
+Type=Package
+# Any kernel package (glob: covers present and future flavors) and any
+# nvidia driver package (a driver removal opens a gap too).
+Target=linux*
+Target=*nvidia*
+
+[Action]
+Description=Checking NVIDIA driver coverage for all installed kernels...
+When=PostTransaction
+Exec=/usr/bin/nkg hook

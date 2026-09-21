@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Mock systemctl: record invocation, always succeed.
+echo "SYSTEMCTL $*" >> "${MOCK_LOG:-/dev/null}"
+exit 0

@@ -1,0 +1,9 @@
+[Unit]
+Description=nvidia-kernel-guard: watch for pending driver gaps
+
+[Path]
+PathChanged=/var/lib/nvidia-kernel-guard/pending
+Unit=nvidia-kernel-guard-autofix.service
+
+[Install]
+WantedBy=multi-user.target

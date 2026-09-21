@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Mock uname: $NKG_TEST_UNAME or fixture uname-r file.
+if [[ "${1:-}" == "-r" ]]; then
+  if [[ -n "${NKG_TEST_UNAME:-}" ]]; then echo "$NKG_TEST_UNAME"
+  elif [[ -n "${NKG_TEST_FIXTURE:-}" && -f "$NKG_TEST_FIXTURE/uname-r" ]]; then cat "$NKG_TEST_FIXTURE/uname-r"
+  else command uname -r; fi
+else
+  command uname "$@"
+fi
