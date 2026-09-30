@@ -8,9 +8,12 @@
 </div>
 
 # nvidia-kernel-guard
+
 ### Every installed kernel gets its NVIDIA driver. No more black screens after a kernel switch.
 
-You install `linux-cachyos-bore` next to `linux-cachyos`. The new kernel boots. Your display manager can't light the GPU because the matching `linux-cachyos-bore-nvidia-open` was never installed. Black screen on every monitor, and the console getty was already claimed by the display manager — so there's not even a shell to fix it from. **This tool makes that failure mode impossible.**
+> You install `linux-cachyos-bore` next to `linux-cachyos`. The new kernel boots. Your display manager can't light the GPU because the matching `linux-cachyos-bore-nvidia-open` was never installed. Black screen on every monitor, and the console getty was already claimed by the display manager — so there's not even a shell to fix it from. **This tool makes that failure mode impossible.**
+
+---
 
 ## How it works
 
@@ -34,27 +37,12 @@ flowchart TB
     I --> M["mkinitcpio rebuild"]
     subgraph boot["every boot"]
         BS["nvidia-kernel-guard.service"]
-        BS --> V{"modules for running\nkernel on disk?"}
+        BS --> V{"modules for running<br/>kernel on disk?"}
         V -->|no| J["journal + wall: exact fix command"]
     end
 ```
 
-## Kernel discovery
-
-Kernels are enumerated from **two independent sources**, merged and deduplicated:
-
-1. **pacman**: packages named `linux*` that ship `/boot/vmlinuz-*`.
-2. **`/usr/lib/modules/*/vmlinuz`**: catches kernels whose image lives in the modules dir (UKI / systemd-boot layouts). The flavor is resolved via the `pkgbase` file, falling back to `pacman -Qo`. Orphaned module dirs (stale versions with no owning package) are skipped.
-
-## Driver states
-
-| State | Meaning |
-|---|---|
-| `covered` | driver package installed, version matches kernel |
-| `covered-dkms` | `nvidia-open-dkms` installed (builds for every kernel) |
-| `skewed` | driver installed but version ≠ kernel version — reinstall |
-| `missing-repo` | not installed, but a prebuilt package exists in the repos |
-| `missing-unknown` | no prebuilt package known — suggests `nvidia-open-dkms` |
+---
 
 ## Quick start
 
@@ -66,6 +54,8 @@ nkg audit
 
 This installs `/usr/bin/nkg`, the pacman hook, the boot audit service, and the post-transaction auto-fix path unit. An existing `/etc/nvidia-kernel-guard.conf` is never clobbered.
 
+---
+
 ## Usage
 
 ```bash
@@ -75,6 +65,46 @@ nkg audit --boot          # also verify the RUNNING kernel has modules
 nkg fix                   # install missing/skewed drivers + mkinitcpio -P (asks first)
 nkg fix --yes             # no prompt (automation)
 ```
+
+---
+
+## Architecture
+
+### Kernel discovery
+
+Kernels are enumerated from **two independent sources**, merged and deduplicated:
+
+1. **pacman**: packages named `linux*` that ship `/boot/vmlinuz-*`.
+2. **`/usr/lib/modules/*/vmlinuz`**: catches kernels whose image lives in the modules dir (UKI / systemd-boot layouts). The flavor is resolved via the `pkgbase` file, falling back to `pacman -Qo`. Orphaned module dirs (stale versions with no owning package) are skipped.
+
+### Driver mapping & states
+
+For a kernel package `linux-<flavor>`, the guard probes the repos in order:
+
+1. `linux-<flavor>-nvidia-open` (or `-nvidia` when `DRIVER_FLAVOR=proprietary`)
+2. stock-arch special cases (`linux` → `nvidia-open`, `linux-lts` → `nvidia-lts`)
+3. if nothing prebuilt exists → tells you to use `nvidia-open-dkms` (the universal fallback that builds for every kernel)
+
+Because it probes instead of hardcoding, new kernel flavors (CachyOS adds them regularly) are handled with zero updates.
+
+| State | Meaning |
+|---|---|
+| `covered` | driver package installed, version matches kernel |
+| `covered-dkms` | `nvidia-open-dkms` installed (builds for every kernel) |
+| `skewed` | driver installed but version ≠ kernel version — reinstall |
+| `missing-repo` | not installed, but a prebuilt package exists in the repos |
+| `missing-unknown` | no prebuilt package known — suggests `nvidia-open-dkms` |
+
+### Why not just use DKMS?
+
+`nvidia-open-dkms` *is* a valid answer — one package, builds for every kernel. Trade-offs:
+
+- **DKMS**: universal, but compiles on every kernel update (slow on big updates, needs headers for every kernel, build can fail).
+- **nvidia-kernel-guard + prebuilt**: zero compile time, uses your distro's tested modules, and the guard closes the "forgot the new flavor" gap that prebuilt packages have.
+
+Use the guard if you like prebuilt modules and multiple kernel flavors. Use DKMS if you'd rather compile. The guard will tell you when DKMS is your only option.
+
+---
 
 ## Config
 
@@ -86,24 +116,7 @@ AUTO_FIX=no               # yes = `nkg fix` never prompts
 HOOK_AUTOFIX=yes          # yes = pacman hook auto-installs missing drivers post-transaction
 ```
 
-## Architecture
-
-The mapping logic: for a kernel package `linux-<flavor>`, the guard probes the repos in order:
-
-1. `linux-<flavor>-nvidia-open` (or `-nvidia` when `DRIVER_FLAVOR=proprietary`)
-2. stock-arch special cases (`linux` → `nvidia-open`, `linux-lts` → `nvidia-lts`)
-3. if nothing prebuilt exists → tells you to use `nvidia-open-dkms` (the universal fallback that builds for every kernel)
-
-Because it probes instead of hardcoding, new kernel flavors (CachyOS adds them regularly) are handled with zero updates.
-
-### Why not just use DKMS?
-
-`nvidia-open-dkms` *is* a valid answer — one package, builds for every kernel. Trade-offs:
-
-- **DKMS**: universal, but compiles on every kernel update (slow on big updates, needs headers for every kernel, build can fail).
-- **nvidia-kernel-guard + prebuilt**: zero compile time, uses your distro's tested modules, and the guard closes the "forgot the new flavor" gap that prebuilt packages have.
-
-Use the guard if you like prebuilt modules and multiple kernel flavors. Use DKMS if you'd rather compile. The guard will tell you when DKMS is your only option.
+---
 
 ## Dev
 
@@ -118,6 +131,8 @@ bash tests/run.sh    # 11 tests: missing driver, version skew, multi-flavor,
 
 CI runs shellcheck + the suite on every push (`.github/`).
 
+---
+
 ## The incident that built this
 
 2026-09-20: a kernel cutover to `linux-cachyos-bore` on an RTX 3090 box. `sddm` (which `Conflicts=getty@tty1.service`) couldn't render the greeter — no driver for the new kernel — so: black screen on DP-1/DP-2, no console fallback. Fixed by installing `linux-cachyos-bore-nvidia-open` and rebuilding the initramfs. This repo exists so that class of outage can't recur silently.
@@ -128,6 +143,10 @@ CI runs shellcheck + the suite on every push (`.github/`).
 - `pacman`, `mkinitcpio`, `systemd`
 - sudo for `fix` / install
 
-## License
+---
 
-MIT — see [LICENSE](LICENSE).
+## License & security
+
+**MIT** — see [LICENSE](LICENSE).
+
+`nkg fix` and the auto-fix path install packages and rebuild initramfs as root — by design. `audit` is fully read-only. Review `install.sh` and `bin/` before running on a production box; the test suite (`tests/run.sh`) runs without root or a GPU.
